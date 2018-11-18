@@ -69,24 +69,13 @@ class GCNRelationModel(nn.Module):
             print("Finetune all embeddings.")
 
     def forward(self, inputs):
-        words, masks, pos, ner, deprel, head, subj_pos, obj_pos, subj_type, obj_type = inputs # unpack
-        l = (masks.data.cpu().numpy() == 0).astype(np.int64).sum(1)
-        maxlen = max(l)
+        words, masks, pos, ner, deprel, adjs, adj_masks, subj_pos, obj_pos, subj_type, obj_type = inputs # unpack
+        h = self.gcn(words, masks, pos, ner, adjs)
 
-        def inputs_to_tree_reps(head, words, l, prune, subj_pos, obj_pos):
-            trees = [head_to_tree(head[i], words[i], l[i], prune, subj_pos[i], obj_pos[i]) for i in range(len(l))]
-            adj = [tree_to_adj(maxlen, tree, directed=False, self_loop=False).reshape(1, maxlen, maxlen) for tree in trees]
-            adj = np.concatenate(adj, axis=0)
-            adj = torch.from_numpy(adj)
-            return Variable(adj.cuda()) if self.opt['cuda'] else Variable(adj)
-
-        adj = inputs_to_tree_reps(head.data, words.data, l, self.opt['prune_k'], subj_pos.data, obj_pos.data)
-        h, pool_mask = self.gcn(adj, inputs)
-        
         # pooling
         subj_mask, obj_mask = subj_pos.eq(0).eq(0).unsqueeze(2), obj_pos.eq(0).eq(0).unsqueeze(2) # invert mask
         pool_type = self.opt['pooling']
-        h_out = pool(h, pool_mask, type=pool_type)
+        h_out = pool(h, adj_masks, type=pool_type)
         subj_out = pool(h, subj_mask, type=pool_type)
         obj_out = pool(h, obj_mask, type=pool_type)
         outputs = torch.cat([h_out, subj_out, obj_out], dim=1)
@@ -114,14 +103,24 @@ class GCN(nn.Module):
             self.rnn_drop = nn.Dropout(opt['rnn_dropout']) # use on last layer output
 
         self.in_drop = nn.Dropout(opt['input_dropout'])
-        self.gcn_drop = nn.Dropout(opt['gcn_dropout'])
 
         # gcn layer
-        self.W = nn.ModuleList()
+        layers = []
+        if opt['graph_model'] == 'GCN':
+            for layer in range(self.layers):
+                input_dim = self.in_dim if layer == 0 else self.mem_dim
+                if layer != self.layers-1:
+                    drop = opt['gcn_dropout']
+                else:
+                    drop = 0
+                layers.append(GCN_layer(input_dim, self.mem_dim, drop))
+                layers.append(nn.Dropout(p=drop))
+        elif opt['graph_model'] == 'MLP':
+            layers.append(MLP(self.in_dim, self.mem_dim, self.mem_dim, opt['gcn_dropout']))
+        else:
+            layers.append(SGC(self.in_dim, self.mem_dim))
 
-        for layer in range(self.layers):
-            input_dim = self.in_dim if layer == 0 else self.mem_dim
-            self.W.append(nn.Linear(input_dim, self.mem_dim))
+        self.gcn_layers = nn.ModuleList(layers)
 
     def conv_l2(self):
         conv_weights = []
@@ -137,8 +136,7 @@ class GCN(nn.Module):
         rnn_outputs, _ = nn.utils.rnn.pad_packed_sequence(rnn_outputs, batch_first=True)
         return rnn_outputs
 
-    def forward(self, adj, inputs):
-        words, masks, pos, ner, deprel, head, subj_pos, obj_pos, subj_type, obj_type = inputs # unpack
+    def forward(self, words, masks, pos, ner, adjs):
         word_embs = self.emb(words)
         embs = [word_embs]
         if self.opt['pos_dim'] > 0:
@@ -153,24 +151,64 @@ class GCN(nn.Module):
             gcn_inputs = self.rnn_drop(self.encode_with_rnn(embs, masks, words.size()[0]))
         else:
             gcn_inputs = embs
-        
-        # gcn layer
-        denom = adj.sum(2).unsqueeze(2) + 1
-        mask = (adj.sum(2) + adj.sum(1)).eq(0).unsqueeze(2)
+
         # zero out adj for ablation
         if self.opt.get('no_adj', False):
-            adj = torch.zeros_like(adj)
+            adjs = torch.zeros_like(adjs)
 
-        for l in range(self.layers):
-            Ax = adj.bmm(gcn_inputs)
-            AxW = self.W[l](Ax)
-            AxW = AxW + self.W[l](gcn_inputs) # self loop
-            AxW = AxW / denom
+        for l in self.gcn_layers:
+            if isinstance(l, nn.Dropout):
+                gcn_inputs = l(gcn_inputs)
+            else:
+                gcn_inputs = l(gcn_inputs, adjs)
 
-            gAxW = F.relu(AxW)
-            gcn_inputs = self.gcn_drop(gAxW) if l < self.layers - 1 else gAxW
+        return gcn_inputs
 
-        return gcn_inputs, mask
+class GCN_layer(nn.Module):
+    def __init__(self, in_features, out_features, dropout):
+        super(GCN_layer, self).__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.transform = nn.Linear(in_features, out_features)
+        self.dropout = dropout
+        torch.nn.init.kaiming_normal_(self.transform.weight)
+
+    def forward(self, inputs, adjs):
+        AxW = self.transform(adjs.bmm(inputs))
+        gAxW = F.relu(AxW)
+        gAxW = F.dropout(gAxW, p=self.dropout, inplace=True, training=self.training)
+        return gAxW
+
+class SGC(nn.Module):
+    def __init__(self, in_features, out_features):
+        super(SGC, self).__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.transform = nn.Linear(in_features, out_features)
+        torch.nn.init.kaiming_normal_(self.transform.weight)
+
+    def forward(self, inputs, adjs):
+        # return self.transform(adjs.bmm(inputs))
+        return F.relu(self.transform(adjs.bmm(inputs)))
+
+class MLP(nn.Module):
+    def __init__(self, in_features, hidden_features, out_features, dropout):
+        super(MLP, self).__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.transform1 = nn.Linear(in_features, hidden_features)
+        self.transform2 = nn.Linear(hidden_features, out_features)
+        self.dropout = dropout
+        torch.nn.init.kaiming_normal_(self.transform1.weight)
+        torch.nn.init.kaiming_normal_(self.transform2.weight)
+
+    def forward(self, inputs, adjs):
+        AxW = F.relu(self.transform1(inputs))
+        AxW = F.dropout(AxW, p=self.dropout, inplace=True, training=self.training)
+        AxW = self.transform2(AxW)
+        AxW = adjs.bmm(AxW)
+        AxW = F.relu(AxW)
+        return AxW
 
 def pool(h, mask, type='max'):
     if type == 'max':
@@ -191,4 +229,3 @@ def rnn_zero_state(batch_size, hidden_dim, num_layers, bidirectional=True, use_c
         return h0.cuda(), c0.cuda()
     else:
         return h0, c0
-

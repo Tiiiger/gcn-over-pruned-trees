@@ -47,17 +47,18 @@ class Trainer(object):
 
 def unpack_batch(batch, cuda):
     if cuda:
-        inputs = [Variable(b.cuda()) for b in batch[:10]]
-        labels = Variable(batch[10].cuda())
+        inputs = [Variable(b.cuda()) for b in batch[:11]]
+        labels = Variable(batch[11].cuda())
     else:
-        inputs = [Variable(b) for b in batch[:10]]
-        labels = Variable(batch[10])
-    tokens = batch[0]
-    head = batch[5]
-    subj_pos = batch[6]
-    obj_pos = batch[7]
-    lens = batch[1].eq(0).long().sum(1).squeeze()
-    return inputs, labels, tokens, head, subj_pos, obj_pos, lens
+        inputs = [Variable(b) for b in batch[:11]]
+        labels = Variable(batch[11])
+    # tokens = batch[0]
+    # adjs = batch[5]
+    # subj_pos = batch[6]
+    # obj_pos = batch[7]
+    # lens = batch[1].eq(0).long().sum(1).squeeze()
+    # return inputs, labels, tokens, adjs, subj_pos, obj_pos, lens
+    return inputs, labels
 
 class GCNTrainer(Trainer):
     def __init__(self, opt, emb_matrix=None):
@@ -72,7 +73,7 @@ class GCNTrainer(Trainer):
         self.optimizer = torch_utils.get_optimizer(opt['optim'], self.parameters, opt['lr'])
 
     def update(self, batch):
-        inputs, labels, tokens, head, subj_pos, obj_pos, lens = unpack_batch(batch, self.opt['cuda'])
+        inputs, labels = unpack_batch(batch, self.opt['cuda'])
 
         # step forward
         self.model.train()
@@ -93,8 +94,8 @@ class GCNTrainer(Trainer):
         return loss_val
 
     def predict(self, batch, unsort=True):
-        inputs, labels, tokens, head, subj_pos, obj_pos, lens = unpack_batch(batch, self.opt['cuda'])
-        orig_idx = batch[11]
+        inputs, labels = unpack_batch(batch, self.opt['cuda'])
+        orig_idx = batch[12]
         # forward
         self.model.eval()
         logits, _ = self.model(inputs)

@@ -51,8 +51,10 @@ def head_to_tree(head, tokens, len_, prune, subj_pos, obj_pos):
     """
     Convert a sequence of head indexes into a tree object.
     """
-    tokens = tokens[:len_].tolist()
-    head = head[:len_].tolist()
+    if not isinstance(tokens, list):
+        tokens = tokens[:len_].tolist()
+    if not isinstance(head, list):
+        head = head[:len_].tolist()
     root = None
 
     if prune < 0:

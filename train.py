@@ -20,14 +20,16 @@ from model.trainer import GCNTrainer
 from utils import torch_utils, scorer, constant, helper
 from utils.vocab import Vocab
 
+from tensorboardX import SummaryWriter
+
 parser = argparse.ArgumentParser()
-parser.add_argument('--data_dir', type=str, default='dataset/tacred')
+parser.add_argument('--data_dir', type=str, default='dataset/tacred/data/json')
 parser.add_argument('--vocab_dir', type=str, default='dataset/vocab')
 parser.add_argument('--emb_dim', type=int, default=300, help='Word embedding dimension.')
 parser.add_argument('--ner_dim', type=int, default=30, help='NER embedding dimension.')
 parser.add_argument('--pos_dim', type=int, default=30, help='POS embedding dimension.')
 parser.add_argument('--hidden_dim', type=int, default=200, help='RNN hidden state size.')
-parser.add_argument('--num_layers', type=int, default=2, help='Num of RNN layers.')
+parser.add_argument('--num_layers', type=int, default=2, help='Num of GCN layers.')
 parser.add_argument('--input_dropout', type=float, default=0.5, help='Input dropout rate.')
 parser.add_argument('--gcn_dropout', type=float, default=0.5, help='GCN layer dropout rate.')
 parser.add_argument('--word_dropout', type=float, default=0.04, help='The rate at which randomly set a word to UNK.')
@@ -46,7 +48,7 @@ parser.add_argument('--no_adj', dest='no_adj', action='store_true', help="Zero o
 parser.add_argument('--no-rnn', dest='rnn', action='store_false', help='Do not use RNN layer.')
 parser.add_argument('--rnn_hidden', type=int, default=200, help='RNN hidden state size.')
 parser.add_argument('--rnn_layers', type=int, default=1, help='Number of RNN layers.')
-parser.add_argument('--rnn_dropout', type=float, default=0.5, help='RNN dropout rate.')
+parser.add_argument('--rnn_dropout', type=float, default=0.5, help='RNN dropout  rate.')
 
 parser.add_argument('--lr', type=float, default=1.0, help='Applies to sgd and adagrad.')
 parser.add_argument('--lr_decay', type=float, default=0.9, help='Learning rate decay rate.')
@@ -55,7 +57,7 @@ parser.add_argument('--optim', choices=['sgd', 'adagrad', 'adam', 'adamax'], def
 parser.add_argument('--num_epoch', type=int, default=100, help='Number of total training epochs.')
 parser.add_argument('--batch_size', type=int, default=50, help='Training batch size.')
 parser.add_argument('--max_grad_norm', type=float, default=5.0, help='Gradient clipping.')
-parser.add_argument('--log_step', type=int, default=20, help='Print log every k steps.')
+parser.add_argument('--log_step', type=int, default=1363, help='Print log every k steps.')
 parser.add_argument('--log', type=str, default='logs.txt', help='Write training log to file.')
 parser.add_argument('--save_epoch', type=int, default=100, help='Save model checkpoints every k epochs.')
 parser.add_argument('--save_dir', type=str, default='./saved_models', help='Root dir for saving models.')
@@ -69,11 +71,14 @@ parser.add_argument('--cpu', action='store_true', help='Ignore CUDA.')
 parser.add_argument('--load', dest='load', action='store_true', help='Load pretrained model.')
 parser.add_argument('--model_file', type=str, help='Filename of the pretrained model.')
 
+parser.add_argument('--graph_model', type=str, choices=["GCN", "SGC", "MLP"], help='Graph model')
+
 args = parser.parse_args()
+writer = SummaryWriter(log_dir="runs/{}-{}".format(args.id, time.time()))
 
 torch.manual_seed(args.seed)
 np.random.seed(args.seed)
-random.seed(1234)
+random.seed(args.seed)
 if args.cpu:
     args.cuda = False
 elif args.cuda:
@@ -96,8 +101,8 @@ assert emb_matrix.shape[1] == opt['emb_dim']
 
 # load data
 print("Loading data from {} with batch size {}...".format(opt['data_dir'], opt['batch_size']))
-train_batch = DataLoader(opt['data_dir'] + '/train.json', opt['batch_size'], opt, vocab, evaluation=False)
-dev_batch = DataLoader(opt['data_dir'] + '/dev.json', opt['batch_size'], opt, vocab, evaluation=True)
+train_batch = DataLoader(opt['data_dir'] + '/train.json', opt['batch_size'], opt, vocab, evaluation=False, phase="train")
+dev_batch = DataLoader(opt['data_dir'] + '/dev.json', opt['batch_size'], opt, vocab, evaluation=True, phase="val")
 
 model_id = opt['id'] if len(opt['id']) > 1 else '0' + opt['id']
 model_save_dir = opt['save_dir'] + '/' + model_id
@@ -117,12 +122,12 @@ if not opt['load']:
     trainer = GCNTrainer(opt, emb_matrix=emb_matrix)
 else:
     # load pretrained model
-    model_file = opt['model_file'] 
+    model_file = opt['model_file']
     print("Loading model from {}".format(model_file))
     model_opt = torch_utils.load_config(model_file)
     model_opt['optim'] = opt['optim']
     trainer = GCNTrainer(model_opt)
-    trainer.load(model_file)   
+    trainer.load(model_file)
 
 id2label = dict([(v,k) for k,v in label2id.items()])
 dev_score_history = []
@@ -159,6 +164,9 @@ for epoch in range(1, opt['num_epoch']+1):
     dev_loss = dev_loss / dev_batch.num_examples * opt['batch_size']
 
     dev_p, dev_r, dev_f1 = scorer.score(dev_batch.gold(), predictions)
+    writer.add_scalar("train_loss", train_loss, epoch)
+    writer.add_scalar("dev_loss", dev_loss, epoch)
+    writer.add_scalar("dev_f1", dev_f1, epoch)
     print("epoch {}: train_loss = {:.6f}, dev_loss = {:.6f}, dev_f1 = {:.4f}".format(epoch,\
         train_loss, dev_loss, dev_f1))
     dev_score = dev_f1
